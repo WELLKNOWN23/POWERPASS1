@@ -1,4 +1,3 @@
-
 import {
   collection,
   doc,
@@ -6,14 +5,15 @@ import {
   limit,
   onSnapshot,
   query,
+  serverTimestamp,
   setDoc,
+  Timestamp,
   where,
   writeBatch,
   type Unsubscribe,
 } from 'firebase/firestore'
 
-import { httpsCallable } from 'firebase/functions'
-import { auth, db, functions } from '../firebase'
+import { auth, db } from '../firebase'
 
 export type BookingStatus = 'Pending' | 'Confirmed' | 'Cancelled'
 export type PaymentStatus = 'Unpaid' | 'Paid'
@@ -77,14 +77,40 @@ export interface MemberProfileForBooking {
 const bookingsCollection = collection(db, 'bookings')
 const verificationsCollection = collection(db, 'bookingVerifications')
 
+const ONE_HOUR_MS = 60 * 60 * 1000
+
 function attendeeRef(workspaceId: string, uid: string) {
   return doc(db, 'workspaces', workspaceId, 'attendees', uid)
 }
 
+/** Random URL-safe token used for the booking QR code. */
+function newToken(): string {
+  const bytes = new Uint8Array(32)
+  crypto.getRandomValues(bytes)
+
+  return btoa(String.fromCharCode(...Array.from(bytes)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '')
+}
+
+/** Random reference for demo payments. */
+function newPaymentReference(): string {
+  const bytes = new Uint8Array(8)
+  crypto.getRandomValues(bytes)
+
+  const hex = Array.from(bytes)
+    .map(byte => byte.toString(16).padStart(2, '0'))
+    .join('')
+    .toUpperCase()
+
+  return `DEMO-${hex}`
+}
+
 /**
- * Creates a booking through the secure Firebase backend.
- * The backend sets the booking reference, creation time and
- * one-hour expiry. The attendee record is written afterwards.
+ * Creates a booking directly in Firestore (no Cloud Functions needed).
+ * The booking and its public verification record are saved together.
+ * The attendee record is written afterwards.
  */
 export async function createBooking(
   booking: Omit<
@@ -116,47 +142,65 @@ export async function createBooking(
     )
   }
 
-  const createBookingRequest = httpsCallable<
-    {
-      booking: {
-        customerName: string
-        workspaceId: string
-        workspaceName: string
-        location: string
-        date: string
-        guests: number
-        total: number
-      }
-      memberProfile: MemberProfileForBooking
-    },
-    {
-      bookingId: string
-      expiresAt: number
-    }
-  >(functions, 'createBookingRequest')
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(booking.date)) {
+    throw new Error('Please choose a valid booking date.')
+  }
 
-  const result = await createBookingRequest({
-    booking: {
-      customerName: booking.customerName.trim(),
-      workspaceId: String(booking.workspaceId),
-      workspaceName: booking.workspaceName,
-      location: booking.location,
-      date: booking.date,
-      guests: booking.guests,
-      total: booking.total,
-    },
-    memberProfile: {
-      name: memberProfile.name.trim(),
-      workType,
-      visible: memberProfile.visible,
-    },
+  if (
+    !Number.isInteger(booking.guests) ||
+    booking.guests < 1 ||
+    booking.guests > 8
+  ) {
+    throw new Error('Guest count must be between 1 and 8.')
+  }
+
+  if (!Number.isFinite(booking.total) || booking.total <= 0) {
+    throw new Error('Invalid booking total.')
+  }
+
+  const bookingRef = doc(bookingsCollection)
+  const token = newToken()
+  const expiresAt = Timestamp.fromMillis(Date.now() + ONE_HOUR_MS)
+
+  const batch = writeBatch(db)
+
+  batch.set(bookingRef, {
+    userId: currentUser.uid,
+    customerName: booking.customerName.trim(),
+    workspaceId: String(booking.workspaceId),
+    workspaceName: booking.workspaceName,
+    location: booking.location,
+    date: booking.date,
+    guests: booking.guests,
+    total: booking.total,
+
+    status: 'Pending',
+    paymentStatus: 'Unpaid',
+    paymentReference: null,
+
+    qrToken: token,
+    version: 1,
+
+    createdAt: serverTimestamp(),
+    expiresAt,
   })
 
-  const bookingId = result.data.bookingId
+  batch.set(doc(verificationsCollection, token), {
+    bookingReference: bookingRef.id,
+    workspaceName: booking.workspaceName,
+    location: booking.location,
+    date: booking.date,
+    guests: booking.guests,
+    total: booking.total,
 
-  if (!bookingId) {
-    throw new Error('The server did not return a booking reference.')
-  }
+    status: 'Pending',
+    paymentStatus: 'Unpaid',
+
+    expiresAt,
+    createdAt: serverTimestamp(),
+  })
+
+  await batch.commit()
 
   // Best effort: attendee creation must never undo a successful booking.
   try {
@@ -173,7 +217,7 @@ export async function createBooking(
         displayName: memberProfile.name.trim(),
         workType,
         visible: memberProfile.visible,
-        bookingReference: bookingId,
+        bookingReference: bookingRef.id,
       })
     }
   } catch (error) {
@@ -183,7 +227,7 @@ export async function createBooking(
     )
   }
 
-  return bookingId
+  return bookingRef.id
 }
 
 /**
@@ -488,19 +532,77 @@ export function listenToDiscoverableMembers(
     error => onError?.(error),
   )
 }
+
+/**
+ * Demo payment only. No real money is collected.
+ * Runs directly against Firestore (no Cloud Functions needed).
+ * Only the booking owner can confirm payment, and only before expiry.
+ */
 export async function simulateDemoPayment(bookingId: string) {
-  const paymentCall = httpsCallable<
-    { bookingId: string },
-    {
-      success: boolean
-      bookingId: string
-      status: string
-      paymentStatus: string
-      paymentReference: string
+  const currentUser = auth.currentUser
+
+  if (!currentUser) {
+    throw new Error('Please sign in first.')
+  }
+
+  if (!bookingId.trim()) {
+    throw new Error('A valid booking ID is required.')
+  }
+
+  const bookingRef = doc(bookingsCollection, bookingId)
+  const snapshot = await getDoc(bookingRef)
+
+  if (!snapshot.exists()) {
+    throw new Error('Booking not found.')
+  }
+
+  const booking = snapshot.data()
+
+  if (booking.userId !== currentUser.uid) {
+    throw new Error("You cannot pay for another user's booking.")
+  }
+
+  if (booking.status !== 'Pending' || booking.paymentStatus !== 'Unpaid') {
+    throw new Error('This booking is no longer awaiting payment.')
+  }
+
+  const expiresMs = timestampMillis(booking.expiresAt)
+
+  if (expiresMs <= Date.now()) {
+    throw new Error('This booking has expired. Please create a new booking.')
+  }
+
+  const paymentReference = newPaymentReference()
+  const batch = writeBatch(db)
+
+  batch.update(bookingRef, {
+    status: 'Confirmed',
+    paymentStatus: 'Paid',
+    paymentReference,
+    paidAt: serverTimestamp(),
+  })
+
+  if (typeof booking.qrToken === 'string' && booking.qrToken) {
+    const verificationRef = doc(verificationsCollection, booking.qrToken)
+    const verificationSnapshot = await getDoc(verificationRef)
+
+    if (verificationSnapshot.exists()) {
+      batch.update(verificationRef, {
+        status: 'Confirmed',
+        paymentStatus: 'Paid',
+        paymentReference,
+        paidAt: serverTimestamp(),
+      })
     }
-  >(functions, 'simulateDemoPayment')
+  }
 
-  const result = await paymentCall({ bookingId })
+  await batch.commit()
 
-  return result.data
+  return {
+    success: true,
+    bookingId,
+    status: 'Confirmed',
+    paymentStatus: 'Paid',
+    paymentReference,
+  }
 }
