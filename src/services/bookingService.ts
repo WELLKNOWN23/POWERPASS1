@@ -1,3 +1,4 @@
+
 import {
   collection,
   doc,
@@ -7,12 +8,12 @@ import {
   query,
   setDoc,
   where,
-  serverTimestamp,
   writeBatch,
   type Unsubscribe,
 } from 'firebase/firestore'
 
-import { db } from '../firebase'
+import { httpsCallable } from 'firebase/functions'
+import { auth, db, functions } from '../firebase'
 
 export type BookingStatus = 'Pending' | 'Confirmed' | 'Cancelled'
 export type PaymentStatus = 'Unpaid' | 'Paid'
@@ -21,7 +22,6 @@ export interface Booking {
   id: string
   userId: string
   customerName: string
-  // Stored as a STRING so it matches the workspace path used by the rules.
   workspaceId: string
   workspaceName: string
   location: string
@@ -33,6 +33,8 @@ export interface Booking {
   paymentReference: string | null
   qrToken: string | null
   createdAt: unknown
+  expiresAt?: unknown
+  version?: number
 }
 
 export interface PublicBookingVerification {
@@ -46,8 +48,6 @@ export interface PublicBookingVerification {
   paymentStatus: PaymentStatus
 }
 
-// Optional "also booked here" record, stored at
-// workspaces/{workspaceId}/attendees/{uid}
 export interface WorkspaceAttendee {
   uid: string
   workspaceId: string
@@ -57,8 +57,6 @@ export interface WorkspaceAttendee {
   visible: boolean
 }
 
-// Public profile used for discovery, read from users/{uid}.
-// It does NOT depend on any booking.
 export interface DiscoverableMember {
   uid: string
   displayName: string
@@ -84,9 +82,9 @@ function attendeeRef(workspaceId: string, uid: string) {
 }
 
 /**
- * Creates the booking and its public QR verification record in ONE atomic
- * batch. The optional "also booked here" attendee record is written
- * afterwards on a best-effort basis, so it can never block a booking.
+ * Creates a booking through the secure Firebase backend.
+ * The backend sets the booking reference, creation time and
+ * one-hour expiry. The attendee record is written afterwards.
  */
 export async function createBooking(
   booking: Omit<
@@ -100,78 +98,96 @@ export async function createBooking(
   >,
   memberProfile: MemberProfileForBooking,
 ): Promise<string> {
-  if (!crypto.randomUUID) {
-    throw new Error(
-      'Your browser cannot create a secure booking reference. Please use an updated browser.',
-    )
+  const currentUser = auth.currentUser
+
+  if (!currentUser) {
+    throw new Error('Please sign in before creating a booking.')
   }
 
-  const workspaceId = String(booking.workspaceId)
+  if (booking.userId !== currentUser.uid) {
+    throw new Error('Your account does not match this booking.')
+  }
+
   const workType = memberProfile.workType.trim()
 
   if (workType.length < 2) {
-    throw new Error('Please add your work type to your profile before booking.')
+    throw new Error(
+      'Please add your work type to your profile before booking.',
+    )
   }
 
-  const bookingRef = doc(bookingsCollection)
-  const token = crypto.randomUUID()
-  const verificationRef = doc(verificationsCollection, token)
+  const createBookingRequest = httpsCallable<
+    {
+      booking: {
+        customerName: string
+        workspaceId: string
+        workspaceName: string
+        location: string
+        date: string
+        guests: number
+        total: number
+      }
+      memberProfile: MemberProfileForBooking
+    },
+    {
+      bookingId: string
+      expiresAt: number
+    }
+  >(functions, 'createBookingRequest')
 
-  const bookingData = {
-    ...booking,
-    workspaceId,
-    customerName: booking.customerName.trim(),
-    status: 'Pending' as const,
-    paymentStatus: 'Unpaid' as const,
-    paymentReference: null,
-    qrToken: token,
-    createdAt: serverTimestamp(),
+  const result = await createBookingRequest({
+    booking: {
+      customerName: booking.customerName.trim(),
+      workspaceId: String(booking.workspaceId),
+      workspaceName: booking.workspaceName,
+      location: booking.location,
+      date: booking.date,
+      guests: booking.guests,
+      total: booking.total,
+    },
+    memberProfile: {
+      name: memberProfile.name.trim(),
+      workType,
+      visible: memberProfile.visible,
+    },
+  })
+
+  const bookingId = result.data.bookingId
+
+  if (!bookingId) {
+    throw new Error('The server did not return a booking reference.')
   }
 
-  const publicData = {
-    bookingReference: bookingRef.id,
-    workspaceName: booking.workspaceName,
-    location: booking.location,
-    date: booking.date,
-    guests: booking.guests,
-    total: booking.total,
-    status: 'Pending',
-    paymentStatus: 'Unpaid',
-    createdAt: serverTimestamp(),
-  }
-
-  const batch = writeBatch(db)
-
-  batch.set(bookingRef, bookingData)
-  batch.set(verificationRef, publicData)
-
-  await batch.commit()
-
-  // Best effort: never let this fail the booking.
+  // Best effort: attendee creation must never undo a successful booking.
   try {
-    const memberRef = attendeeRef(workspaceId, booking.userId)
+    const memberRef = attendeeRef(
+      String(booking.workspaceId),
+      currentUser.uid,
+    )
+
     const existingMember = await getDoc(memberRef)
 
     if (!existingMember.exists()) {
       await setDoc(memberRef, {
-        uid: booking.userId,
+        uid: currentUser.uid,
         displayName: memberProfile.name.trim(),
         workType,
         visible: memberProfile.visible,
-        bookingReference: bookingRef.id,
+        bookingReference: bookingId,
       })
     }
   } catch (error) {
-    console.warn('Booking saved, but the attendee record was not written:', error)
+    console.warn(
+      'Booking saved, but the attendee record was not written:',
+      error,
+    )
   }
 
-  return bookingRef.id
+  return bookingId
 }
 
 /**
- * Cancels a booking, marks its QR record as Cancelled, and (optionally)
- * removes the user's attendee record for that workspace, atomically.
- * Pass removeAttendee = false if the user has another active booking there.
+ * Cancels a booking and updates its public verification record.
  */
 export async function cancelBooking(
   booking: Booking,
@@ -179,29 +195,44 @@ export async function cancelBooking(
 ): Promise<void> {
   const batch = writeBatch(db)
 
-  batch.update(doc(bookingsCollection, booking.id), { status: 'Cancelled' })
+  batch.update(
+    doc(bookingsCollection, booking.id),
+    { status: 'Cancelled' },
+  )
 
   if (booking.qrToken) {
-    const verificationRef = doc(verificationsCollection, booking.qrToken)
+    const verificationRef = doc(
+      verificationsCollection,
+      booking.qrToken,
+    )
+
     const verificationSnapshot = await getDoc(verificationRef)
 
     if (verificationSnapshot.exists()) {
-      batch.update(verificationRef, { status: 'Cancelled' })
+      batch.update(verificationRef, {
+        status: 'Cancelled',
+      })
     }
   }
 
   if (removeAttendee) {
-    batch.delete(attendeeRef(String(booking.workspaceId), booking.userId))
+    batch.delete(
+      attendeeRef(
+        String(booking.workspaceId),
+        booking.userId,
+      ),
+    )
   }
 
   await batch.commit()
 }
 
 /**
- * Permanently deletes a booking, but ONLY if it is already Cancelled.
- * The rules enforce the same restriction on the server.
+ * Permanently deletes a booking only if it is already cancelled.
  */
-export async function deleteCancelledBooking(booking: Booking): Promise<void> {
+export async function deleteCancelledBooking(
+  booking: Booking,
+): Promise<void> {
   if (booking.status !== 'Cancelled') {
     throw new Error('Only cancelled bookings can be deleted.')
   }
@@ -211,7 +242,11 @@ export async function deleteCancelledBooking(booking: Booking): Promise<void> {
   batch.delete(doc(bookingsCollection, booking.id))
 
   if (booking.qrToken) {
-    const verificationRef = doc(verificationsCollection, booking.qrToken)
+    const verificationRef = doc(
+      verificationsCollection,
+      booking.qrToken,
+    )
+
     const verificationSnapshot = await getDoc(verificationRef)
 
     if (
@@ -226,8 +261,7 @@ export async function deleteCancelledBooking(booking: Booking): Promise<void> {
 }
 
 /**
- * Keeps the user's attendee records in sync when their name, work type or
- * visibility changes.
+ * Keeps attendee records synchronized with profile changes.
  */
 export async function syncAttendeeProfile(
   userId: string,
@@ -251,6 +285,7 @@ export async function syncAttendeeProfile(
         workType: profile.workType.trim(),
         visible: profile.visible,
       })
+
       updates += 1
     }
   }
@@ -260,6 +295,9 @@ export async function syncAttendeeProfile(
   }
 }
 
+/**
+ * Retrieves public booking verification details.
+ */
 export async function getPublicBookingVerification(
   token: string,
 ): Promise<PublicBookingVerification | null> {
@@ -267,7 +305,11 @@ export async function getPublicBookingVerification(
     return null
   }
 
-  const verificationRef = doc(verificationsCollection, token)
+  const verificationRef = doc(
+    verificationsCollection,
+    token,
+  )
+
   const snapshot = await getDoc(verificationRef)
 
   if (!snapshot.exists()) {
@@ -284,20 +326,27 @@ export async function getPublicBookingVerification(
     guests: Number(data.guests || 0),
     total: Number(data.total || 0),
     status: String(data.status || 'Pending') as BookingStatus,
-    paymentStatus: String(data.paymentStatus || 'Unpaid') as PaymentStatus,
+    paymentStatus: String(
+      data.paymentStatus || 'Unpaid',
+    ) as PaymentStatus,
   }
 }
 
 function timestampMillis(value: unknown): number {
   if (!value || typeof value !== 'object') return 0
 
-  const timestamp = value as { toMillis?: () => number }
+  const timestamp = value as {
+    toMillis?: () => number
+  }
 
   return typeof timestamp.toMillis === 'function'
     ? timestamp.toMillis()
     : 0
 }
 
+/**
+ * Real-time bookings belonging to one user.
+ */
 export function listenToUserBookings(
   userId: string,
   onBookings: (bookings: Booking[]) => void,
@@ -311,11 +360,11 @@ export function listenToUserBookings(
   return onSnapshot(
     bookingsQuery,
     snapshot => {
-      // 'estimate' fills in createdAt for a booking that is still being
-      // written, so a brand-new booking sorts to the TOP instead of the end.
       const bookings = snapshot.docs.map(item => ({
         id: item.id,
-        ...item.data({ serverTimestamps: 'estimate' }),
+        ...item.data({
+          serverTimestamps: 'estimate',
+        }),
       })) as Booking[]
 
       bookings.sort(
@@ -332,7 +381,6 @@ export function listenToUserBookings(
 
 /**
  * Real-time list of visible people who booked the given workspaces.
- * The rules only allow reading a workspace's attendees if you are one too.
  */
 export function listenToWorkspaceAttendees(
   workspaceIds: string[],
@@ -350,7 +398,12 @@ export function listenToWorkspaceAttendees(
 
   const unsubscribes = uniqueIds.map(workspaceId => {
     const attendeesQuery = query(
-      collection(db, 'workspaces', workspaceId, 'attendees'),
+      collection(
+        db,
+        'workspaces',
+        workspaceId,
+        'attendees',
+      ),
       where('visible', '==', true),
     )
 
@@ -365,27 +418,33 @@ export function listenToWorkspaceAttendees(
             return {
               uid: item.id,
               workspaceId,
-              displayName: String(data.displayName || 'Member'),
+              displayName: String(
+                data.displayName || 'Member',
+              ),
               workType: String(data.workType || ''),
-              bookingReference: String(data.bookingReference || ''),
+              bookingReference: String(
+                data.bookingReference || '',
+              ),
               visible: data.visible === true,
             }
           }),
         )
 
-        onMembers(Array.from(results.values()).flat())
+        onMembers(
+          Array.from(results.values()).flat(),
+        )
       },
       error => onError?.(error),
     )
   })
 
-  return () => unsubscribes.forEach(unsubscribe => unsubscribe())
+  return () => {
+    unsubscribes.forEach(unsubscribe => unsubscribe())
+  }
 }
 
 /**
- * Real-time list of every member (freelancers AND companies) who has left
- * their profile visible. No booking is required to appear here.
- * The query MUST filter on visible == true to satisfy the rules.
+ * Real-time list of visible freelancers and companies.
  */
 export function listenToDiscoverableMembers(
   onMembers: (members: DiscoverableMember[]) => void,
@@ -411,16 +470,37 @@ export function listenToDiscoverableMembers(
             skills: Array.isArray(data.skills)
               ? data.skills.map(String).slice(0, 10)
               : [],
-            role: data.role === 'company' ? 'company' : 'freelancer',
+            role:
+              data.role === 'company'
+                ? 'company'
+                : 'freelancer',
             title: String(data.title || ''),
             organisation: String(data.organisation || ''),
             bio: String(data.bio || ''),
           } as DiscoverableMember
         })
-        .filter(member => member.workType.trim().length >= 2)
+        .filter(
+          member => member.workType.trim().length >= 2,
+        )
 
       onMembers(members)
     },
     error => onError?.(error),
   )
+}
+export async function simulateDemoPayment(bookingId: string) {
+  const paymentCall = httpsCallable<
+    { bookingId: string },
+    {
+      success: boolean
+      bookingId: string
+      status: string
+      paymentStatus: string
+      paymentReference: string
+    }
+  >(functions, 'simulateDemoPayment')
+
+  const result = await paymentCall({ bookingId })
+
+  return result.data
 }

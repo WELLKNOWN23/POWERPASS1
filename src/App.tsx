@@ -68,6 +68,7 @@ import WorkspaceMap from './components/WorkspaceMap'
 import {
   cancelBooking as cancelBookingInFirestore,
   createBooking as saveBookingToFirestore,
+  simulateDemoPayment,
   deleteCancelledBooking,
   getPublicBookingVerification,
   listenToDiscoverableMembers,
@@ -1113,6 +1114,7 @@ function Dashboard({ user }: { user: User }) {
   const [category, setCategory] = useState('All spaces')
   const [saved, setSaved] = useState<number[]>([])
   const [bookingSubmitting, setBookingSubmitting] = useState(false)
+  const [paymentProcessingId, setPaymentProcessingId] = useState<string | null>(null)
   const [bookings, setBookings] = useState<Booking[]>([])
   const [selected, setSelected] = useState<number | null>(null)
   const [bookingDate, setBookingDate] = useState('')
@@ -1503,10 +1505,14 @@ function Dashboard({ user }: { user: User }) {
   const incomingRequests = requests.filter(request => request.toUid === user.uid)
   const outgoingRequests = requests.filter(request => request.fromUid === user.uid)
 
-  const acceptedRequests = requests.filter(
-    request =>
-      request.status === 'Accepted' &&
-      (request.fromUid === user.uid || request.toUid === user.uid),
+  const acceptedRequests = useMemo(
+    () =>
+      requests.filter(
+        request =>
+          request.status === 'Accepted' &&
+          (request.fromUid === user.uid || request.toUid === user.uid),
+      ),
+    [requests, user.uid],
   )
 
   const chatContacts = useMemo(() => {
@@ -1782,6 +1788,32 @@ function Dashboard({ user }: { user: User }) {
     } catch (error) {
       console.error('Booking cancellation error:', error)
       notify('Unable to cancel this booking. Please try again.')
+    }
+  }
+
+  async function payForBooking(booking: Booking) {
+    // Prevent double payments while one is already in progress.
+    if (paymentProcessingId) return
+
+    setPaymentProcessingId(booking.id)
+
+    try {
+      notify('Processing demo payment...')
+
+      const result = await simulateDemoPayment(booking.id)
+
+      if (result.success) {
+        notify('Demo payment successful! Your booking is confirmed.')
+      }
+    } catch (error) {
+      console.error('Demo payment failed:', error)
+
+      const message =
+        error instanceof Error ? error.message : 'Please try again.'
+
+      notify(`Payment failed: ${message}`)
+    } finally {
+      setPaymentProcessingId(null)
     }
   }
 
@@ -2180,7 +2212,7 @@ function Dashboard({ user }: { user: User }) {
 
                   {booking.status === 'Confirmed' && (
                     <p className="section-subtitle">
-                      Your booking has been confirmed.
+                      Demo payment completed. Your booking is confirmed.
                     </p>
                   )}
 
@@ -2191,9 +2223,25 @@ function Dashboard({ user }: { user: User }) {
                     </div>
 
                     {booking.status === 'Pending' && (
-                      <button onClick={() => void cancelBooking(booking)}>
-                        <X size={15} /> Cancel
-                      </button>
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => void payForBooking(booking)}
+                          disabled={paymentProcessingId === booking.id}
+                        >
+                          <CheckCircle2 size={15} />
+                          {paymentProcessingId === booking.id
+                            ? 'Processing...'
+                            : 'Simulate demo payment'}
+                        </button>
+
+                        <button
+                          onClick={() => void cancelBooking(booking)}
+                          disabled={paymentProcessingId === booking.id}
+                        >
+                          <X size={15} /> Cancel
+                        </button>
+                      </>
                     )}
 
                     {booking.status === 'Cancelled' && (
